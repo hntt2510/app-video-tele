@@ -1,0 +1,1440 @@
+"""
+MODULE 5: ĐẠO DIỄN & GHÉP NỐI TOÀN BỘ MODULE (Master Video Compositor & Pipeline V2.1)
+======================================================================================
+Chức năng:
+  - Nhạc trưởng điều phối toàn bộ các module: Kịch bản -> Thẻ -> Diễn xuất -> Âm thanh -> Dựng phim
+  - HẠN CHẾ HARDCODE 100%: Mọi thông số lấy từ config/director_config.json qua src/config.py
+  - NÂNG CẤP CHẤT LƯỢNG TOÀN DIỆN:
+    + 60 FPS Native siêu mượt
+    + Visually Lossless CRF 18 + BT.709 HD Color Matrix
+    + Chuyển động thẻ trượt mượt mà (Smooth Slide-Up with Ease-Out)
+    + Hỗ trợ cả Video Meme Reaction (.mp4) và Sticker PNG (.png)
+    + Camera Shake động học khi có cú twist bẻ lái
+"""
+
+import os
+import sys
+import subprocess
+import time
+import random
+import re
+from datetime import datetime
+from PIL import Image
+
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(SRC_DIR)
+sys.path.insert(0, SRC_DIR)
+
+import config as config_mod
+import pipeline_tracker as tracker
+import satisfying_manager
+
+OUT_DIR    = os.path.join(BASE_DIR, "output")
+CARDS_DIR  = os.path.join(OUT_DIR, "cards")
+AUDIO_DIR  = os.path.join(OUT_DIR, "audio")
+FINAL_DIR  = os.path.join(OUT_DIR, "final")
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+SFX_DIR    = os.path.join(ASSETS_DIR, "sfx")
+MEME_DIR   = os.path.join(ASSETS_DIR, "memes")
+
+import importlib.util
+
+def load_module(name: str, filename: str):
+    path = os.path.join(SRC_DIR, filename)
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+content_mod = load_module("content", "01_content.py")
+card_mod    = load_module("card_gen", "02_card_gen.py")
+tts_mod     = load_module("tts", "03_tts.py")
+bg_mod      = load_module("bg_audio", "04_bg_audio.py")
+
+
+def build_timeline_with_emotional_pacing(post, timing: dict, layout_preset: str = None, bg_mode: str = None) -> tuple[list[dict], list[str], float, list[dict]]:
+    """
+    Tính mốc thời gian hiển thị từng thẻ, danh sách audio cần nối kèm khoảng lặng nhịp thở,
+    SFX meme tại điểm rơi (ưu tiên video meme .mp4 trước PNG) và dữ liệu đồ thị cảm xúc cho Web UI.
+    Hỗ trợ bố cục đa dạng: split_screen (TikTok Split), center (truyền thống), bottom_story.
+    """
+    cfg = config_mod.load_config()
+    layout = cfg.get("visual_layout", {})
+
+    card_w = layout.get("card_width", 960)
+    card_gap = layout.get("comment_card_gap", 24)
+    sticker_sz = layout.get("sticker_size", 440)
+    sticker_offset = layout.get("sticker_offset_y", 28)
+
+    # 1. Tính toán trước chiều cao thẻ để tự động căn chỉnh vào Vùng An Toàn (TikTok/Reels Safe-Zone)
+    post_path = os.path.join(CARDS_DIR, "post.png")
+    actual_post_h = 320
+    if os.path.exists(post_path):
+        try:
+            with Image.open(post_path) as p_img:
+                actual_post_h = p_img.height
+        except Exception:
+            pass
+
+    # Nếu thẻ bài viết có ảnh minh họa đính kèm, tự động cân đối kích thước meme và khoảng cách
+    if actual_post_h > 450:
+        sticker_sz = 350
+        card_gap = 18
+        sticker_offset = 20
+
+    max_cmt_h = 280
+    for idx in range(1, len(post.comments) + 1):
+        c_path = os.path.join(CARDS_DIR, f"comment_{idx}.png")
+        if os.path.exists(c_path):
+            try:
+                with Image.open(c_path) as c_file:
+                    if c_file.height > max_cmt_h:
+                        max_cmt_h = c_file.height
+            except Exception:
+                pass
+
+    has_meme = any(getattr(c, "sfx", "none") != "none" for c in post.comments)
+    total_stack_h = actual_post_h + card_gap + max_cmt_h + (sticker_sz + sticker_offset if has_meme else 0)
+
+    # Đáy vùng an toàn TikTok/Reels/Shorts: tuyệt đối không vượt quá y = 1460 (tránh bị che bởi caption, username, avatar, nút like/share)
+    max_safe_bottom = 1460
+
+    mode_str = (bg_mode or "").lower()
+    preset_str = (layout_preset or "").lower()
+
+    # TÙY CHỌN BỐ CỤC SANDWICH ĐỈNH CAO TIKTOK:
+    # 1. Thẻ bài viết ở trên (100 - 140px)
+    # 2. VIDEO Ở CHÍNH GIỮA (Minecraft gameplay, Ghép hình puzzle, Mukbang, ASMR cắt xà phòng, hoặc Video tư liệu thật)
+    # 3. Thẻ bình luận đối đáp ở dưới (1000 - 1050px)
+    custom_center = getattr(post, "center_video_custom_path", "")
+    has_custom_center = bool(custom_center and os.path.exists(custom_center))
+
+    enable_center_sat = False
+    if has_custom_center:
+        enable_center_sat = True
+    elif preset_str in ["sandwich", "center_satisfying"] or "sandwich" in mode_str:
+        enable_center_sat = True
+    elif any(k in mode_str for k in ["puzzle", "food", "mukbang", "asmr", "hypnotic", "sand", "kinetic"]):
+        enable_center_sat = True
+    elif layout.get("enable_center_satisfying_video", True):
+        # Mặc định kích hoạt nếu không chọn layout split_screen hoặc bottom_story
+        if preset_str not in ["split_screen", "bottom_story"]:
+            enable_center_sat = True
+
+    sat_cat = layout.get("center_satisfying_category", "random")
+    if "puzzle" in mode_str:
+        sat_cat = "puzzle"
+    elif "food" in mode_str or "mukbang" in mode_str:
+        sat_cat = "food"
+    elif "asmr" in mode_str:
+        sat_cat = "asmr"
+    elif "gameplay" in mode_str or "parkour" in mode_str:
+        sat_cat = "gameplay"
+    elif "hypnotic" in mode_str or "spiral" in mode_str or "geometry" in mode_str:
+        sat_cat = "hypnotic"
+    elif "sand" in mode_str or "kinetic" in mode_str:
+        sat_cat = "kinetic_sand"
+
+    # AI Đạo Diễn Khớp Video Nền Ở Giữa Theo Ngữ Cảnh Chủ Đề
+    if enable_center_sat:
+        post_sat = getattr(post, "satisfying_category", "auto")
+        if post_sat and post_sat not in ["auto", "random", "none"]:
+            sat_cat = post_sat
+        elif sat_cat in ["random", "auto"]:
+            post_text_lower = (getattr(post, "content", "") + " " + getattr(post, "video_title", "")).lower()
+            if any(k in post_text_lower for k in ["ăn", "bánh", "nấu", "bếp", "món", "cháo", "trứng", "cafe", "trà sữa", "đói", "cơm"]):
+                sat_cat = "food"
+            elif any(k in post_text_lower for k in ["it", "dev", "sếp", "ot", "lương", "xe", "game", "tốc độ", "chạy", "senior"]):
+                sat_cat = "gameplay"
+            elif any(k in post_text_lower for k in ["tâm sự", "buồn", "khóc", "chia tay", "chữa lành", "yêu", "đêm", "ngủ"]):
+                sat_cat = "asmr"
+            elif any(k in post_text_lower for k in ["bóc phốt", "phát hiện", "mật khẩu", "tin nhắn", "rình", "bằng chứng", "tra hỏi", "nghi ngờ", "sự thật", "lén"]):
+                sat_cat = "puzzle"
+            else:
+                sat_cat = random.choice(["kinetic_sand", "hypnotic", "gameplay", "puzzle", "food"])
+
+    center_vid_file = None
+    if has_custom_center:
+        center_vid_file = custom_center
+    elif enable_center_sat:
+        center_vid_file = bg_mod.get_satisfying_video_path(sat_cat)
+
+    if enable_center_sat and center_vid_file and os.path.exists(center_vid_file):
+        center_video_w = layout.get("center_satisfying_width", 960)
+
+        # TÍNH TOÁN VỊ TRÍ & CHIỀU CAO THÔNG MINH CHO BỐ CỤC 3 TẦNG (SANDWICH):
+        # Đảm bảo video ở giữa luôn hiển thị trọn vẹn, không bao giờ bị thẻ comment đè lên!
+        if actual_post_h > 450:
+            # Thẻ bài viết có ảnh minh họa đính kèm: đặt post_y ở 65px để dành nhiều không gian cho video giữa và comment
+            post_y = 65
+            center_video_h = 360
+            center_video_y = post_y + actual_post_h + 20
+            actual_comment_y = center_video_y + center_video_h + 28
+        else:
+            post_y = 95
+            center_video_h = layout.get("center_satisfying_height", 480)
+            center_video_y = post_y + actual_post_h + 22
+            actual_comment_y = center_video_y + center_video_h + 30
+
+        # BẢO VỆ VÙNG AN TOÀN TIKTOK/REELS/SHORTS (Đáy an toàn 1720px chuẩn 9:16):
+        # Nếu tổng chiều cao dài hơn vùng an toàn, đẩy post lên và co nhẹ video giữa,
+        # TUYỆT ĐỐI KHÔNG để thẻ comment nhảy lên đè vào video giữa!
+        max_safe_bottom = 1720
+        if actual_comment_y + max_cmt_h > max_safe_bottom:
+            overflow = (actual_comment_y + max_cmt_h) - max_safe_bottom
+            shift_up = min(overflow, post_y - 45)
+            post_y -= max(0, shift_up)
+            overflow -= max(0, shift_up)
+            if overflow > 0:
+                reduce_h = min(overflow, center_video_h - 260)
+                center_video_h -= max(0, reduce_h)
+                overflow -= max(0, reduce_h)
+            center_video_y = post_y + actual_post_h + 16
+            actual_comment_y = center_video_y + center_video_h + 24
+
+        if has_custom_center:
+            print(f"  🎬 [TƯ LIỆU THẬT]: Video tư liệu câu chuyện chính giữa 960x{center_video_h}px (y={center_video_y}): {center_vid_file}")
+        else:
+            print(f"  ✨ [BỐ CỤC SANDWICH TIKTOK]: Video thỏa mãn ({sat_cat}) ở chính giữa 960x{center_video_h}px (y={center_video_y})!")
+
+    elif preset_str == "split_screen" or mode_str in ["split", "split_gameplay", "split_screen"]:
+        # Bố cục chia nửa màn hình: gameplay 60FPS phía trên (0-720px), thẻ Threads phía dưới (từ 740px)
+        post_y = 740
+        actual_comment_y = post_y + actual_post_h + card_gap
+    elif preset_str == "bottom_story":
+        target_y = 750
+        post_y = max(220, min(target_y, max_safe_bottom - total_stack_h))
+        actual_comment_y = post_y + actual_post_h + card_gap
+    else:
+        # Bố cục Toàn Màn Hình Chuẩn Threads/TikTok (Center Focus)
+        if actual_post_h > 450:
+            post_y = 120  # Có ảnh minh họa đính kèm: đặt ở 120px
+        else:
+            post_y = layout.get("post_card_y", 240)
+        if post_y + total_stack_h > max_safe_bottom:
+            post_y = max(120, max_safe_bottom - total_stack_h)
+        actual_comment_y = post_y + actual_post_h + card_gap
+
+    # BẢO VỆ VÙNG AN TOÀN TIKTOK/REELS/SHORTS (Bottom Safe Zone):
+    max_safe_bottom = 1720
+    if actual_comment_y + max_cmt_h > max_safe_bottom:
+        overflow = (actual_comment_y + max_cmt_h) - max_safe_bottom
+        post_y = max(45, post_y - overflow)
+        if enable_center_sat and center_vid_file and os.path.exists(center_vid_file):
+            center_video_y = post_y + actual_post_h + 16
+            actual_comment_y = center_video_y + center_video_h + 24
+        else:
+            actual_comment_y = post_y + actual_post_h + card_gap
+
+    timeline = []
+    audio_sequence = []
+    emotional_arc_data = []
+    overlay_sfx = []
+
+    cursor = 0.2
+    silence_idx = 0
+
+    whoosh_sfx = os.path.join(SFX_DIR, "whoosh.mp3")
+    pop_sfx = os.path.join(SFX_DIR, "pop.mp3")
+    camera_sfx = os.path.join(SFX_DIR, "camera.mp3")
+    enable_foley = layout.get("enable_foley_sfx", True)
+
+    # Đồng bộ audio_sequence với cursor khởi đầu (0.2s)
+    silence_file = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+    silence_idx += 1
+    tts_mod.generate_silence_mp3(cursor, silence_file)
+    audio_sequence.append(silence_file)
+
+    # Foley Whoosh khi thẻ bài viết chính lướt vào
+    if enable_foley and os.path.exists(whoosh_sfx):
+        overlay_sfx.append({"time": cursor, "file": whoosh_sfx, "vol": 0.35})
+
+    # 1. Thẻ bài đăng (Hook & Context)
+    post_dur = timing["post"]["duration_ms"] / 1000.0
+    post_pause_after = min(0.18, getattr(post, "pause_after_ms", 150) / 1000.0)
+
+    audio_sequence.append(timing["post"]["path"])
+
+    # Chèn khoảng lặng tự nhiên sau bài viết
+    if post_pause_after > 0.04:
+        silence_file = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+        silence_idx += 1
+        tts_mod.generate_silence_mp3(post_pause_after, silence_file)
+        audio_sequence.append(silence_file)
+
+    emotional_arc_data.append({
+        "beat": "1. Mở Màn / Hook",
+        "role": f"Tác giả (@{post.username})",
+        "emotion": getattr(post, "hook_energy", "high"),
+        "energy_level": 85,
+        "voice": timing["post"].get("voice", "Nam Minh"),
+        "text": post.content[:80] + ("..." if len(post.content) > 80 else ""),
+        "duration_s": round(post_dur, 2),
+        "sfx": "none",
+        "pause_ms": int(post_pause_after * 1000)
+    })
+
+    if not enable_center_sat:
+        actual_comment_y = post_y + actual_post_h + card_gap
+    comment_cursor = cursor + post_dur + post_pause_after
+
+    # Vị trí cố định của Hộp Video Meme phía dưới thẻ comment (phóng to 440px)
+    meme_anchor_y = actual_comment_y + max_cmt_h + sticker_offset
+    enable_anchor_meme = layout.get("enable_continuous_anchor_meme", False)
+    punchline_center = layout.get("punchline_meme_popup_center", True)
+    punchline_sz = layout.get("punchline_meme_popup_size", 780)
+
+    # BỘ SƯU TẬP MEME ĐA PHÂN ĐOẠN:
+    # 1. Hook (Mở màn): tò mò, ngơ ngác, bất ngờ
+    hook_meme_pool = ["huh.gif", "shocked_cat.gif", "math.gif", "dancing_cat.gif"]
+    hook_choices = [m for m in hook_meme_pool if os.path.exists(os.path.join(MEME_DIR, m))]
+    hook_meme = random.choice(hook_choices) if hook_choices else "dancing_cat.gif"
+    hook_img_path = os.path.join(MEME_DIR, hook_meme)
+
+    if enable_anchor_meme:
+        print(f"  🎬 Hiển thị Meme đồng hành liên tục (Kích thước {sticker_sz}px):")
+        print(f"     [Hook Mở Màn] -> {hook_meme}")
+        if os.path.exists(hook_img_path):
+            timeline.append({
+                "type": "anchor_meme",
+                "start": cursor,
+                "end": comment_cursor,
+                "x": "(W-w)/2",
+                "y": str(meme_anchor_y),
+                "width": sticker_sz,
+                "camera_motion": "none",
+                "image": hook_img_path,
+                "is_video": hook_meme.endswith(".mp4"),
+                "is_gif": hook_meme.endswith(".gif"),
+                "enable_slide": True
+            })
+    else:
+        print(f"  ✨ Chế độ Tinh Gọn & Thỏa Mãn Thị Giác: Tắt meme chạy nền liên tục, nhường toàn bộ spotlight cho video thỏa mãn người xem!")
+
+    # Kho meme theo từng vai trò bình luận để tự đổi mới liên tục:
+    cmt_speaking_pools = {
+        1: ["dancing_cat.gif", "applause.gif", "laugh.gif"],
+        2: ["shocked_cat.gif", "clown.gif", "huh.gif"],
+        3: ["side_eye.gif", "awkward.gif", "facepalm.gif", "math.gif"],
+        4: ["shock.gif", "clown.gif", "huh.gif"],
+        5: ["bruh.gif", "facepalm.gif", "side_eye.gif"],
+        6: ["laugh.gif", "dancing_cat.gif", "bruh.gif"]
+    }
+
+    # ─── ĐỒNG BỘ ĐIỂM RƠI BẰNG CHỨNG (PROOF SYNCHRONIZATION) ──────────────────
+    # Xác định CHÍNH XÁC bình luận nào sẽ bung thẻ ảnh popup:
+    # 1. Ưu tiên bình luận trực tiếp đưa ra bằng chứng ("đây nè", "tui chụp lại", "nhìn ảnh nè", "hình đây...")
+    # 2. Nếu có người hỏi xin ảnh ("có ảnh không?", "có hình không?"), bung đúng ở câu TRẢ LỜI kế tiếp (k + 1)!
+    # 3. Fallback: bung tại cú Twist (sub_drop/boom) hoặc bình luận kề cuối.
+    illus_cfg = cfg.get("illustration_settings", {})
+    popup_card_path = os.path.join(CARDS_DIR, "popup_proof.png")
+    has_popup = illus_cfg.get("enable_popup_illustration", True) and os.path.exists(popup_card_path)
+
+    popup_target_comment_idx = -1
+    if has_popup:
+        answer_cues = ["đây nè", "đây này", "đây nha", "tui chụp", "mình chụp", "ảnh đây", "hình đây", "nhìn ảnh", "xem ảnh", "coi ảnh", "bằng chứng đây", "chụp lại nè", "kết quả đây", "hóa đơn đây"]
+        for idx_c, cmt in enumerate(post.comments, 1):
+            c_low = cmt.content.lower()
+            if any(cue in c_low for cue in answer_cues):
+                popup_target_comment_idx = idx_c
+                print(f"  🎯 [ĐIỂM RƠI BẰNG CHỨNG]: Bình luận {idx_c} (@{cmt.username}) trực tiếp giới thiệu ảnh!")
+                break
+
+        if popup_target_comment_idx == -1:
+            for idx_c, cmt in enumerate(post.comments, 1):
+                c_low = cmt.content.lower()
+                has_img_word = any(w in c_low for w in ["ảnh", "hình", "bằng chứng", "chứng cứ"])
+                has_ask_word = any(w in c_low for w in ["không", "chưa", "đâu", "xin", "hả", "sao", "?"])
+                if has_img_word and has_ask_word:
+                    if idx_c < len(post.comments):
+                        popup_target_comment_idx = idx_c + 1
+                        print(f"  🎯 [ĐIỂM RƠI BẰNG CHỨNG]: Bình luận {idx_c} hỏi xin ảnh -> Bung ở câu TRẢ LỜI {popup_target_comment_idx} (@{post.comments[idx_c].username})!")
+                    else:
+                        popup_target_comment_idx = idx_c
+                    break
+
+        if popup_target_comment_idx == -1:
+            for idx_c, cmt in enumerate(post.comments, 1):
+                if getattr(cmt, "sfx", "none") in ["sub_drop", "boom", "shock"]:
+                    popup_target_comment_idx = idx_c
+                    break
+            if popup_target_comment_idx == -1:
+                popup_target_comment_idx = max(2, len(post.comments) - 1)
+            print(f"  🎯 [ĐIỂM RƠI BẰNG CHỨNG]: Bung ảnh tại cú Twist / Bình luận {popup_target_comment_idx}!")
+
+    popup_shown = False
+
+    # 2. Xử lý từng bình luận (Đẩy cao trào -> Cú Twist -> Chốt hạ)
+    for i, c in enumerate(post.comments, 1):
+        c_dur = timing["comments"][i - 1]["duration_ms"] / 1000.0
+        c_audio_path = timing["comments"][i - 1]["path"]
+        sfx_name = getattr(c, "sfx", "none")
+        emotion = getattr(c, "emotion", "funny")
+        cam_motion = getattr(c, "camera_motion", "none")
+        sfx_info = config_mod.get_sfx_info(sfx_name)
+
+        # Khoảng lặng tự nhiên giữa các câu nói (nhịp thở nhanh gọn 60ms - 150ms)
+        pause_before = min(0.12, max(0.06, getattr(c, "pause_before_ms", 100) / 1000.0))
+        pause_after = min(0.18, max(0.08, getattr(c, "pause_after_ms", 120) / 1000.0))
+
+        # Khoảng lặng trước câu nói (nhịp thở tự nhiên)
+        if pause_before > 0.05:
+            silence_file = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+            silence_idx += 1
+            tts_mod.generate_silence_mp3(pause_before, silence_file)
+            audio_sequence.append(silence_file)
+
+        audio_sequence.append(c_audio_path)
+
+        c_start = comment_cursor + pause_before
+        react_start = c_start + c_dur
+
+        # XỬ LÝ SFX ĐIỂM RƠI: LỒNG ĐÈ (OVERLAY) CHUYÊN NGHIỆP, KHÔNG NỐI TUẦN TỰ GÂY CHẾT NHỊP!
+        sfx_file = None
+        sfx_filename = sfx_info.get("sfx_file")
+        if sfx_filename and sfx_name != "none":
+            candidate = os.path.join(SFX_DIR, sfx_filename)
+            if os.path.exists(candidate):
+                sfx_file = candidate
+                sfx_vol = sfx_info.get("vol", 0.40)
+                # Đánh trúng điểm rơi punchline ngay khi câu nói vừa dứt (-0.05s)
+                overlay_sfx.append({
+                    "time": max(0.0, react_start - 0.05),
+                    "file": sfx_file,
+                    "vol": sfx_vol
+                })
+                print(f"     🔊 [SFX OVERLAY PUNCHLINE]: {sfx_name} (vol={sfx_vol}) tại t={react_start:.2f}s")
+
+                # Tension Riser Swell (Gió rít căng thẳng tăng dần 1.1s trước khi cú bẻ lái nổ tung)
+                enable_riser = layout.get("enable_tension_riser", True)
+                riser_path = os.path.join(SFX_DIR, "riser.mp3")
+                if enable_riser and os.path.exists(riser_path) and sfx_name in ["sub_drop", "boom"]:
+                    riser_time = max(0.0, react_start - 1.2)
+                    overlay_sfx.append({
+                        "time": riser_time,
+                        "file": riser_path,
+                        "vol": 0.32
+                    })
+                    print(f"     🔥 [TENSION RISER SWELL]: Gió rít căng thẳng tăng dần tại t={riser_time:.2f}s trước cú Twist!")
+
+        # Hiệu ứng chuyển động thông minh theo vai trò (Spring Pop, Conversational Slide Left/Right)
+        enable_slide = layout.get("enable_slide_up_animation", True)
+        cmt_reply_to = getattr(c, "reply_to", "")
+        global_trans_style = layout.get("transition_style", "dynamic_conversational")
+        if global_trans_style == "spring_pop":
+            cmt_transition = "spring_pop"
+        elif global_trans_style == "slide_up":
+            cmt_transition = "slide_up"
+        else:  # "dynamic_conversational"
+            if sfx_name in ["boom", "sub_drop"]:
+                cmt_transition = "spring_pop"
+            elif cmt_reply_to and cmt_reply_to != post.username:
+                cmt_transition = "slide_right"
+            elif i % 2 == 1:
+                cmt_transition = "spring_pop"
+            else:
+                cmt_transition = "slide_left"
+
+        # Card lead time: trượt trước 0.12s để thẻ cố định vị trí đúng khi giọng đọc bắt đầu phát âm
+        card_visual_start = max(0.0, c_start - 0.12) if (enable_slide and cmt_transition != "none") else c_start
+
+        # Foley Pop giòn tan khi thẻ bình luận trượt lên
+        if enable_foley and os.path.exists(pop_sfx):
+            overlay_sfx.append({"time": card_visual_start, "file": pop_sfx, "vol": 0.35})
+
+        # Nhịp điệu TikTok nhanh gọn nhưng đủ thời lượng để meme reaction hiển thị (0.45s - 0.70s)
+        has_meme_sticker = (sfx_name != "none" and sfx_info.get("meme_file"))
+        if has_meme_sticker:
+            extra_react_time = max(0.45, min(0.70, pause_after + 0.30))
+        else:
+            extra_react_time = max(0.10, min(0.25, pause_after))
+
+        c_end = react_start + extra_react_time
+
+        # Đồng bộ audio_sequence với c_end
+        silence_file = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+        silence_idx += 1
+        tts_mod.generate_silence_mp3(extra_react_time, silence_file)
+        audio_sequence.append(silence_file)
+
+        if sfx_name in ["boom", "sub_drop"] and cam_motion == "none":
+            cam_motion = "shake"
+
+        # Đưa thẻ bình luận vào timeline với hiệu ứng chuyển cảnh sống động
+        timeline.append({
+            "type": "comment",
+            "index": i,
+            "start": card_visual_start,
+            "end": c_end,
+            "x": "(W-w)/2",
+            "y": actual_comment_y,
+            "width": card_w,
+            "camera_motion": cam_motion,
+            "transition": cmt_transition,
+            "shake_start": react_start if cam_motion == "shake" else 0,
+            "shake_end": react_start + min(0.6, extra_react_time) if cam_motion == "shake" else 0,
+            "image": os.path.join(CARDS_DIR, f"comment_{i}.png"),
+            "is_video": False,
+            "enable_slide": True
+        })
+
+        # Kích hoạt popup ảnh minh họa nổi chuẩn xác tại điểm rơi đối đáp đã đồng bộ trước:
+        is_popup_target = (has_popup and not popup_shown and i == popup_target_comment_idx)
+        if is_popup_target:
+            popup_shown = True
+
+        # Tìm meme phản ứng sẵn có (Chỉ tải visual nếu meme_file được khai báo khác None)
+        meme_file_cand = None
+        is_meme_video = False
+        is_meme_gif = False
+        target_meme_file = sfx_info.get("meme_file")
+
+        if target_meme_file:
+            cand_path = os.path.join(MEME_DIR, target_meme_file)
+            if os.path.exists(cand_path):
+                meme_file_cand = cand_path
+                is_meme_gif = target_meme_file.endswith(".gif")
+                is_meme_video = target_meme_file.endswith(".mp4")
+            else:
+                # Thử các định dạng khác cùng tên nếu file chỉ định bị thiếu đuôi
+                base_name = os.path.splitext(target_meme_file)[0]
+                for ext in [".gif", ".mp4", ".png"]:
+                    cand_alt = os.path.join(MEME_DIR, base_name + ext)
+                    if os.path.exists(cand_alt):
+                        meme_file_cand = cand_alt
+                        is_meme_gif = ext == ".gif"
+                        is_meme_video = ext == ".mp4"
+                        break
+
+        # Tự động trích xuất âm thanh nếu người dùng đưa file video meme (.mp4) trực tiếp
+        if is_meme_video and meme_file_cand and not sfx_file:
+            cand_sfx = os.path.join(SFX_DIR, f"{sfx_name}.mp3")
+            if not os.path.exists(cand_sfx):
+                exe = bg_mod.get_ffmpeg_exe()
+                subprocess.run([exe, "-y", "-i", meme_file_cand, "-vn", "-c:a", "libmp3lame", "-q:a", "2", cand_sfx], capture_output=True)
+            if os.path.exists(cand_sfx) and os.path.getsize(cand_sfx) > 1000:
+                sfx_file = cand_sfx
+                overlay_sfx.append({
+                    "time": max(0.0, react_start - 0.05),
+                    "file": sfx_file,
+                    "vol": sfx_info.get("vol", 0.50)
+                })
+                print(f"     🔊 [TỰ ĐỘNG PHÁT TIẾNG TỪ VIDEO MEME MP4]: {os.path.basename(cand_sfx)} tại t={react_start:.2f}s")
+
+
+        # Kiểm tra thẻ bằng chứng / tư liệu:
+        # Hỗ trợ cả thẻ đơn lẻ mặc định và danh sách nhiều mốc tư liệu (popup_illustrations)
+        custom_popups = [p for p in getattr(post, "popup_illustrations", []) if p.get("target_comment_idx") == i and os.path.exists(p.get("path", ""))]
+        current_popup_path = popup_card_path
+        if custom_popups:
+            is_popup_target = True
+            current_popup_path = custom_popups[0]["path"]
+        else:
+            is_popup_target = (i == popup_target_comment_idx)
+
+        if is_popup_target and current_popup_path and os.path.exists(current_popup_path):
+            # CUTAWAY PROOF CARD: Xuất hiện chính giữa màn hình (H-h)/2 với hiệu ứng Punch-in Bounce
+            # Thời lượng hiển thị khớp trọn vẹn với câu trả lời (tối thiểu 2.4s, đồng bộ lời nói)
+            base_dur = float(illus_cfg.get("popup_duration_s", 2.6))
+            popup_start = c_start + 0.20
+            popup_end = min(popup_start + max(base_dur, c_dur - 0.2), c_end)
+            popup_y = "(H-h)/2"
+
+            print(f"     🎬 [CUTAWAY BẰNG CHỨNG ĐỒNG BỘ CÂU TRẢ LỜI {i}] -> {popup_start:.2f}s đến {popup_end:.2f}s: {os.path.basename(current_popup_path)}")
+            timeline.append({
+                "type": "popup_illustration",
+                "start": popup_start,
+                "end": popup_end,
+                "x": "(W-w)/2",
+                "y": popup_y,
+                "width": 980,
+                "height": 640,
+                "camera_motion": "punch_in_bounce",
+                "image": current_popup_path,
+                "is_video": False,
+                "is_gif": False,
+                "enable_slide": False
+            })
+
+            # Foley Camera Shutter khi ảnh minh họa nảy ra giữa màn hình
+            if enable_foley:
+                if os.path.exists(camera_sfx):
+                    overlay_sfx.append({"time": popup_start, "file": camera_sfx, "vol": 0.5})
+                elif os.path.exists(pop_sfx):
+                    overlay_sfx.append({"time": popup_start, "file": pop_sfx, "vol": 0.4})
+            # Trong thời gian Cutaway Gag (2.2s), hình ảnh chiếm trọn spotlight
+            # Sau khi Cutaway biến mất, nếu còn thời gian thì reaction meme punchline sẽ xuất hiện
+            if react_start > popup_end and meme_file_cand and os.path.exists(meme_file_cand):
+                m_x = "(W-w)/2"
+                m_y = "(H-h)/2" if punchline_center else str(actual_comment_y + max_cmt_h + 16)
+                m_w = punchline_sz if punchline_center else sticker_sz
+                m_motion = "shake" if sfx_name == "boom" else "punch_in_bounce"
+
+                timeline.append({
+                    "type": "meme_reaction",
+                    "start": react_start,
+                    "end": c_end,
+                    "x": m_x,
+                    "y": m_y,
+                    "width": m_w,
+                    "camera_motion": m_motion,
+                    "image": meme_file_cand,
+                    "is_video": is_meme_video,
+                    "is_gif": is_meme_gif,
+                    "enable_slide": False
+                })
+        else:
+            # A. Trong lúc người đó đang nói (c_start đến react_start): chỉ hiện nếu bật enable_anchor_meme
+            pool_i = cmt_speaking_pools.get(i, ["dancing_cat.gif", "huh.gif"])
+            valid_pool_i = [m for m in pool_i if os.path.exists(os.path.join(MEME_DIR, m))]
+            speak_meme_name = random.choice(valid_pool_i) if valid_pool_i else "dancing_cat.gif"
+            speak_meme_path = os.path.join(MEME_DIR, speak_meme_name)
+
+            if enable_anchor_meme and os.path.exists(speak_meme_path) and react_start > c_start + 0.1:
+                timeline.append({
+                    "type": "anchor_meme",
+                    "start": c_start,
+                    "end": react_start,
+                    "x": "(W-w)/2",
+                    "y": str(meme_anchor_y),
+                    "width": sticker_sz,
+                    "camera_motion": "none",
+                    "image": speak_meme_path,
+                    "is_video": speak_meme_name.endswith(".mp4"),
+                    "is_gif": speak_meme_name.endswith(".gif"),
+                    "enable_slide": False
+                })
+
+            # B. Tại điểm rơi Punchline / Bẻ lái (react_start đến c_end):
+            # Kích hoạt meme reaction popup tại điểm bẻ lái cao trào
+            enable_meme_popups = layout.get("enable_meme_reaction_popups", True)
+            if enable_meme_popups and meme_file_cand and extra_react_time >= 0.20:
+                m_x = "(W-w)/2"
+                m_y = "(H-h)/2" if punchline_center else str(meme_anchor_y)
+                m_w = punchline_sz if punchline_center else sticker_sz
+                m_motion = "shake" if sfx_name in ["boom", "sub_drop"] else "punch_in_bounce"
+
+                print(f"     🎬 [PUNCHLINE REACTION ĐÈ RA GIỮA PHÓNG TO {m_w}px] -> {os.path.basename(meme_file_cand)} (SFX: {sfx_name})")
+                timeline.append({
+                    "type": "meme_reaction",
+                    "start": react_start,
+                    "end": c_end,
+                    "x": m_x,
+                    "y": m_y,
+                    "width": m_w,
+                    "camera_motion": m_motion,
+                    "image": meme_file_cand,
+                    "is_video": is_meme_video,
+                    "is_gif": is_meme_gif,
+                    "enable_slide": False
+                })
+            elif enable_anchor_meme and os.path.exists(speak_meme_path):
+                timeline.append({
+                    "type": "anchor_meme",
+                    "start": react_start,
+                    "end": c_end,
+                    "x": "(W-w)/2",
+                    "y": str(meme_anchor_y),
+                    "width": sticker_sz,
+                    "camera_motion": "none",
+                    "image": speak_meme_path,
+                    "is_video": speak_meme_name.endswith(".mp4"),
+                    "is_gif": speak_meme_name.endswith(".gif"),
+                    "enable_slide": False
+                })
+
+        # Ghi nhận dữ liệu nhịp cảm xúc
+        energy_map = {"funny": 70, "shocked": 98, "awkward": 65, "sarcastic": 80, "neutral": 50}
+        emotional_arc_data.append({
+            "beat": f"{i+1}. Bình luận {i}" + (" (Bẻ lái sốc)" if sfx_name in ["boom", "sub_drop"] else (" (Chốt hạ)" if i == len(post.comments) else "")),
+            "role": f"@{c.username}",
+            "emotion": emotion,
+            "energy_level": energy_map.get(emotion, 75),
+            "voice": timing["comments"][i-1].get("voice", "N/A"),
+            "text": c.content[:70] + ("..." if len(c.content) > 70 else ""),
+            "duration_s": round(c_dur + extra_react_time, 2),
+            "sfx": sfx_name,
+            "camera": cam_motion,
+            "pause_ms": int((pause_before + extra_react_time) * 1000)
+        })
+
+        comment_cursor = c_end
+
+    # 3. Thẻ Outro Call-To-Action (Kêu gọi bình luận & thả tim tương tác)
+    enable_outro = layout.get("enable_outro_cta", True)
+    outro_card_path = os.path.join(CARDS_DIR, "outro_cta.png")
+    if enable_outro and os.path.exists(outro_card_path):
+        # Giọng đọc kêu gọi tương tác (TTS Outro)
+        cta_q = getattr(post, "cta_question", "") or "Còn bạn thì sao? Hãy thả tim và để lại bình luận câu chuyện của bạn nhé!"
+        for emo in ["👇", "❤️", "😱", "😂", "💀", "🔥", "✨"]:
+            cta_q = cta_q.replace(emo, "").strip()
+
+        outro_dur = float(layout.get("outro_cta_duration_s", 2.6))
+        outro_voice_file = os.path.join(AUDIO_DIR, "outro_cta.mp3")
+        outro_info = timing.get("outro") if timing else None
+
+        actual_outro_dur = 0.0
+        if outro_info and os.path.exists(outro_info.get("path", "")):
+            outro_voice_file = outro_info["path"]
+            actual_outro_dur = outro_info["duration_ms"] / 1000.0
+            audio_sequence.append(outro_voice_file)
+        elif os.path.exists(outro_voice_file) and bg_mod.get_media_duration(outro_voice_file) > 0.5:
+            actual_outro_dur = bg_mod.get_media_duration(outro_voice_file)
+            audio_sequence.append(outro_voice_file)
+        else:
+            try:
+                tts_mod.text_to_speech(cta_q, outro_voice_file, voice="vi-VN-HoaiMyNeural", rate="+18%")
+                actual_outro_dur = bg_mod.get_media_duration(outro_voice_file)
+                if actual_outro_dur > 0.5:
+                    audio_sequence.append(outro_voice_file)
+                else:
+                    raise ValueError("Outro voice duration too short")
+            except Exception:
+                actual_outro_dur = outro_dur
+                silence_outro = os.path.join(AUDIO_DIR, "_outro_silence.mp3")
+                tts_mod.generate_silence_mp3(actual_outro_dur, silence_outro)
+                audio_sequence.append(silence_outro)
+
+        # Chèn khoảng dừng thở tự nhiên 0.25s đồng bộ sau câu Outro
+        outro_pause = 0.25
+        silence_file = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+        silence_idx += 1
+        tts_mod.generate_silence_mp3(outro_pause, silence_file)
+        audio_sequence.append(silence_file)
+
+        outro_dur = actual_outro_dur + outro_pause
+        outro_start = comment_cursor
+        outro_end = comment_cursor + outro_dur
+        timeline.append({
+            "type": "outro_cta",
+            "start": outro_start,
+            "end": outro_end,
+            "x": "(W-w)/2",
+            "y": str(actual_comment_y),
+            "width": card_w,
+            "camera_motion": "punch_in_bounce",
+            "image": outro_card_path,
+            "is_video": False,
+            "is_gif": False,
+            "enable_slide": True
+        })
+        if enable_foley and os.path.exists(whoosh_sfx):
+            overlay_sfx.append({"time": outro_start, "file": whoosh_sfx, "vol": 0.45})
+
+        # Icon sticker / Reaction GIF sống động cho câu cuối (Outro Celebration Reaction)
+        outro_stickers = [m for m in ["applause.gif", "dancing_cat.gif", "ting.gif"] if os.path.exists(os.path.join(MEME_DIR, m))]
+        if outro_stickers:
+            outro_stk = os.path.join(MEME_DIR, outro_stickers[0])
+            timeline.append({
+                "type": "outro_sticker",
+                "start": outro_start + 0.15,
+                "end": outro_end,
+                "x": "(W-w)/2",
+                "y": str(max(200, actual_comment_y - 200)),
+                "width": 240,
+                "camera_motion": "punch_in_bounce",
+                "image": outro_stk,
+                "is_video": False,
+                "is_gif": True,
+                "enable_slide": False
+            })
+
+        emotional_arc_data.append({
+            "beat": "Kết Thúc / Outro Call-To-Action",
+            "role": "Studio CTA",
+            "emotion": "interactive",
+            "energy_level": 90,
+            "voice": outro_info.get("voice", "vi-VN-HoaiMyNeural") if outro_info else "vi-VN-HoaiMyNeural",
+            "text": cta_q,
+            "duration_s": outro_dur,
+            "sfx": "whoosh",
+            "camera": "punch_in_bounce",
+            "pause_ms": 0
+        })
+        comment_cursor = outro_end
+
+    # Khoảng dừng tự nhiên trước khi kết thúc video (đệm đúng 0.3s silence vào audio_sequence)
+    post_outro_pause = 0.3
+    silence_file = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+    silence_idx += 1
+    tts_mod.generate_silence_mp3(post_outro_pause, silence_file)
+    audio_sequence.append(silence_file)
+    comment_cursor += post_outro_pause
+    total_duration = comment_cursor
+
+    # Đảm bảo video đạt chuẩn tối thiểu 1 phút (>= 60s cho TikTok Creator Rewards)
+    min_required_duration = float(layout.get("min_video_duration_s", 60.5))
+    enforce_min = layout.get("enforce_min_duration_60s", True)
+    if enforce_min and total_duration < min_required_duration:
+        pad_needed = min_required_duration - total_duration
+        print(f"  ⏱️ [CHUẨN VIDEO 1 PHÚT+]: Tự động đệm {pad_needed:.2f}s vào phần outro để video đạt đúng {min_required_duration:.1f}s!")
+        pad_silence = os.path.join(AUDIO_DIR, f"_silence_{silence_idx}.mp3")
+        silence_idx += 1
+        tts_mod.generate_silence_mp3(pad_needed, pad_silence)
+        audio_sequence.append(pad_silence)
+        total_duration = min_required_duration
+
+    # Ghim thẻ Outro tới đúng total_duration (không để biến mất trước khi video kết thúc)
+    if enable_outro:
+        for t_item in timeline:
+            if t_item.get("type") in ["outro_cta", "outro_sticker"]:
+                t_item["end"] = total_duration
+
+    # Outro anchor meme đến hết video (chỉ hiện nếu bật enable_continuous_anchor_meme)
+    outro_meme = os.path.join(MEME_DIR, "dancing_cat.gif")
+    if enable_anchor_meme and os.path.exists(outro_meme) and total_duration > comment_cursor - 0.2:
+        timeline.append({
+            "type": "anchor_meme",
+            "start": comment_cursor - 0.2,
+            "end": total_duration,
+            "x": "(W-w)/2",
+            "y": str(meme_anchor_y),
+            "width": sticker_sz,
+            "camera_motion": "none",
+            "image": outro_meme,
+            "is_video": False,
+            "is_gif": True,
+            "enable_slide": False
+        })
+
+    # 1. Thẻ Post hiển thị: Tự động phân nhánh theo Sentence Reveal Mode
+    reveal_mode = getattr(post, "sentence_reveal_mode", "standard_full")
+    if actual_post_h > 450:
+        # Nếu thẻ bài viết có ảnh minh họa đính kèm, luôn hiển thị full thẻ chuẩn để tránh nhảy giật layout
+        reveal_mode = "standard_full"
+
+    raw_sentences = re.split(r"(?<=[.!?\n])\s+", post.content.strip())
+    sentences = [s.strip() for s in raw_sentences if s.strip()]
+
+    post_entries = []
+    if reveal_mode == "progressive_line_reveal" and len(sentences) >= 2:
+        # Tính thời lượng từng câu có trọng số ngắt nghỉ theo dấu câu
+        def calc_sentence_weight(s: str) -> float:
+            w_count = len(s.split())
+            pause_pts = s.count(",") * 1.5 + s.count(";") * 1.5 + (s.count(".") + s.count("!") + s.count("?")) * 2.5
+            return max(1.0, w_count + pause_pts)
+
+        weights = [calc_sentence_weight(s) for s in sentences]
+        total_w = sum(weights)
+        step_durs = [post_dur * (w / total_w) for w in weights]
+
+        step_cursor = cursor
+        for step_idx in range(1, len(sentences)):
+            step_end = step_cursor + step_durs[step_idx - 1]
+            step_file = os.path.join(CARDS_DIR, f"post_step_{step_idx}.png")
+            if not os.path.exists(step_file):
+                step_file = os.path.join(CARDS_DIR, "post.png")
+
+            post_entries.append({
+                "type": "post",
+                "start": step_cursor,
+                "end": step_end,
+                "x": "(W-w)/2",
+                "y": post_y,
+                "width": card_w,
+                "camera_motion": "none",
+                "image": step_file,
+                "is_video": False,
+                "enable_slide": (step_idx == 1)
+            })
+            step_cursor = step_end
+
+        # Câu cuối mở full bài và ghim tới hết video
+        post_entries.append({
+            "type": "post",
+            "start": step_cursor,
+            "end": total_duration,
+            "x": "(W-w)/2",
+            "y": post_y,
+            "width": card_w,
+            "camera_motion": "none",
+            "image": os.path.join(CARDS_DIR, "post.png"),
+            "is_video": False,
+            "enable_slide": False
+        })
+        print(f"  ✨ [SENTENCE REVEAL]: Mở rộng thẻ bài cố định chiều cao theo {len(sentences)} nhịp đọc (t={cursor:.2f}s -> {step_cursor:.2f}s -> {total_duration:.2f}s)")
+    else:
+        post_entries.append({
+            "type": "post",
+            "start": cursor,
+            "end": total_duration,
+            "x": "(W-w)/2",
+            "y": post_y,
+            "width": card_w,
+            "camera_motion": "none",
+            "image": os.path.join(CARDS_DIR, "post.png"),
+            "is_video": False,
+            "enable_slide": True
+        })
+
+    # Đảm bảo thứ tự layer chuẩn: Background -> Video Thỏa Mãn Ở Giữa -> Thẻ Post -> Thẻ Comment & Popup
+    sat_layer_offset = 0
+    if enable_center_sat and center_vid_file and os.path.exists(center_vid_file):
+        timeline.insert(0, {
+            "type": "center_satisfying_video",
+            "start": cursor,
+            "end": total_duration,
+            "x": "(W-w)/2",
+            "y": str(center_video_y),
+            "width": center_video_w,
+            "height": center_video_h,
+            "camera_motion": "none",
+            "image": center_vid_file,
+            "is_video": True,
+            "is_gif": False,
+            "enable_slide": True
+        })
+        sat_layer_offset = 1
+
+    for p_idx, pe in enumerate(post_entries):
+        timeline.insert(sat_layer_offset + p_idx, pe)
+
+    return timeline, audio_sequence, overlay_sfx, total_duration, emotional_arc_data
+
+
+def generate_kinetic_subtitles_ass(post, timing: dict, timeline: list[dict], output_ass_path: str):
+    """
+    Tạo phụ đề động Kinetic Subtitles phong cách Shorts/TikTok (Hormozi word-chunk pop-in):
+    - Font Arial đậm nét, viền đen dày 4.5px, nổi bật trên mọi nền video.
+    - Màu vàng neon (&H0000FFFF) hoặc trắng (&H00FFFFFF) bắt mắt.
+    - Chia nhỏ câu thành từng cụm 3-4 từ nảy nhịp (Word-chunk pop-in) theo đúng nhịp nói,
+      không hiện cả khối dài gây rối mắt, tối đa hóa tỉ lệ giữ chân người xem (Retention).
+    """
+    ass_header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Kinetic,Arial,56,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4.2,2,2,40,40,240,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    dialogues = []
+
+    def format_ass_time(sec: float) -> str:
+        sec = max(0.0, sec)
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        s = sec % 60
+        return f"{h}:{m:02d}:{s:05.2f}"
+
+    def chunk_text_by_words(text: str, start_sec: float, end_sec: float, words_per_chunk: int = 4):
+        clean_t = text.strip().replace("\n", " ")
+        words = clean_t.split()
+        if not words:
+            return
+        total_words = len(words)
+        dur = max(0.5, end_sec - start_sec)
+
+        chunks = []
+        for i in range(0, total_words, words_per_chunk):
+            chunks.append(" ".join(words[i:i + words_per_chunk]))
+
+        chunk_dur = dur / len(chunks)
+        for idx, chunk in enumerate(chunks):
+            c_start = start_sec + idx * chunk_dur
+            c_end = min(end_sec, c_start + chunk_dur)
+            dialogues.append(
+                f"Dialogue: 0,{format_ass_time(c_start)},{format_ass_time(c_end)},Kinetic,,0,0,0,,{{\\fscx106\\fscy106\\t(0,70,\\fscx100\\fscy100)}}{chunk.upper()}"
+            )
+
+    # Lấy các đoạn nói từ timeline
+    post_sub_added = False
+    for item in timeline:
+        itype = item.get("type")
+        if itype == "comment":
+            idx = item.get("index", 1) - 1
+            if idx < len(post.comments):
+                cmt = post.comments[idx]
+                chunk_text_by_words(cmt.content, item["start"], item["end"] - 0.35, words_per_chunk=4)
+        elif itype == "post" and not post_sub_added:
+            post_sub_added = True
+            post_dur = timing.get("post", {}).get("duration_ms", 3000) / 1000.0
+            chunk_text_by_words(post.content[:100], item["start"], item["start"] + post_dur, words_per_chunk=4)
+
+    with open(output_ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_header + "\n".join(dialogues) + "\n")
+
+
+def compose_video(bg_video: str, audio_path: str, timeline: list[dict],
+                  total_duration: float, output_path: str, ass_subtitle_path: str = None):
+    """
+    Dựng phim chuyên nghiệp: 60 FPS, CRF 18, Color Space BT.709,
+    Hiệu ứng trượt thẻ Ease-Out mượt mà & Camera Shake tự động.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    exe = bg_mod.get_ffmpeg_exe()
+    cfg = config_mod.load_config()
+    layout = cfg.get("visual_layout", {})
+
+    fps = layout.get("fps", 60)
+    video_crf = str(layout.get("video_crf", 18))
+    video_preset = layout.get("video_preset", "medium")
+    enable_slide = layout.get("enable_slide_up_animation", True)
+    slide_dur = layout.get("slide_duration_s", 0.22)
+    slide_dist = layout.get("slide_distance_px", 45)
+
+    inputs = ["-i", bg_video, "-i", audio_path]
+    for item in timeline:
+        if item.get("is_gif"):
+            inputs.extend(["-ignore_loop", "0", "-i", item["image"]])
+        elif item.get("is_video"):
+            inputs.extend(["-stream_loop", "-1", "-i", item["image"]])
+        else:
+            inputs.extend(["-i", item["image"]])
+
+    # Input mask bo tròn góc cho Center Satisfying Video
+    mask_file = os.path.join(ASSETS_DIR, "satisfying", "rounded_mask_960x560.png")
+    has_rounded_mask = os.path.exists(mask_file)
+    mask_input_idx = len(timeline) + 2 if has_rounded_mask else None
+    if has_rounded_mask:
+        inputs.extend(["-i", mask_file])
+
+    filter_chains = []
+    prev_stream = "[0:v]"
+
+    for idx, item in enumerate(timeline):
+        img_idx = idx + 2
+        layer_label = f"[layer{idx}]"
+        out_stream = f"[v{idx}]"
+
+        w = item.get("width", 960)
+        start_t = f"{item['start']:.2f}"
+        end_t = f"{item['end']:.2f}"
+        cam_motion = item.get("camera_motion", "none")
+        base_y = str(item["y"])
+        itype = item.get("type", "")
+        h_val = item.get("height")
+
+        # Scale tĩnh theo kích thước chỉ định: nếu có height thì crop vừa vặn, ngược lại giữ aspect ratio
+        if itype == "center_satisfying_video" and h_val and mask_input_idx is not None:
+            # Bo góc 26px mềm mại cho video ở giữa
+            filter_chains.append(
+                f"[{img_idx}:v]scale={w}:{h_val}:force_original_aspect_ratio=increase,crop={w}:{h_val},format=yuva420p[c_raw{idx}];"
+                f"[{mask_input_idx}:v]scale={w}:{h_val}[m_scale{idx}];"
+                f"[c_raw{idx}][m_scale{idx}]alphamerge{layer_label}"
+            )
+        elif h_val:
+            filter_chains.append(f"[{img_idx}:v]scale={w}:{h_val}:force_original_aspect_ratio=increase,crop={w}:{h_val}{layer_label}")
+        else:
+            filter_chains.append(f"[{img_idx}:v]scale={w}:-2:flags=lanczos{layer_label}")
+
+        # Tính toán hiệu ứng chuyển cảnh đa dạng (Spring Pop, Conversational Slide Left/Right, Punch-in Bounce, Shake)
+        trans_type = item.get("transition", "slide_up" if (enable_slide and item.get("enable_slide")) else "none")
+        if cam_motion == "punch_in_bounce":
+            trans_type = "punch_in_bounce"
+
+        base_x = item.get("x", "(W-w)/2")
+        x_pos, y_pos = satisfying_manager.build_transition_expression(
+            trans_type=trans_type,
+            base_x=base_x,
+            base_y=base_y,
+            start_t=item["start"],
+            dur=slide_dur,
+            dist=slide_dist,
+            cam_motion=cam_motion,
+            shake_start=item.get("shake_start", 0),
+            shake_end=item.get("shake_end", 0)
+        )
+
+        filter_chains.append(
+            f"{prev_stream}{layer_label}overlay=x='{x_pos}':y='{y_pos}':enable='between(t,{start_t},{end_t})':format=auto{out_stream}"
+        )
+        prev_stream = out_stream
+
+    # 1. Hiệu ứng Vignette Điện Ảnh (Làm tối nhẹ 4 góc để hướng sự chú ý tuyệt đối vào nội dung giữa màn hình)
+    enable_vignette = layout.get("enable_cinematic_vignette", True)
+    if enable_vignette:
+        out_vig = "[v_vignette]"
+        filter_chains.append(f"{prev_stream}vignette=PI/4:eval=init{out_vig}")
+        prev_stream = out_vig
+
+    # 2. Phụ đề động Kinetic Subtitles (nảy chữ theo nhịp nói kiểu Shorts/TikTok)
+    if ass_subtitle_path and os.path.exists(ass_subtitle_path):
+        clean_ass = os.path.abspath(ass_subtitle_path).replace("\\", "/").replace(":", "\\:")
+        out_sub_stream = "[v_subbed]"
+        filter_chains.append(f"{prev_stream}ass='{clean_ass}'{out_sub_stream}")
+        prev_stream = out_sub_stream
+
+    # 3. Thanh tiến trình video (Completion Progress Bar) chạy ngầm ở đáy màn hình
+    enable_prog_bar = layout.get("enable_completion_progress_bar", True)
+    if enable_prog_bar:
+        bar_h = int(layout.get("progress_bar_height", 6))
+        bar_color = layout.get("progress_bar_color", "#F43F5E")
+        bar_y = 1920 - bar_h
+        out_bar_bg = "[v_bar_bg]"
+        out_bar_fill = "[v_bar_fill]"
+        # Dải ray nền đen mờ 40%
+        filter_chains.append(f"{prev_stream}drawbox=x=0:y={bar_y}:w=1080:h={bar_h}:color=black@0.4:t=fill{out_bar_bg}")
+        # Dải thanh tiến trình gradient hồng tím chạy từ 0 đến 100% video
+        filter_chains.append(f"{out_bar_bg}drawbox=x=0:y={bar_y}:w='1080*(t/{max(0.1, total_duration):.3f})':h={bar_h}:color={bar_color}@0.95:t=fill{out_bar_fill}")
+        prev_stream = out_bar_fill
+
+    filter_complex = ";".join(filter_chains)
+
+    cmd = [
+        exe, "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", prev_stream,
+        "-map", "1:a",
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", video_preset,
+        "-crf", video_crf,
+        "-c:a", "aac",
+        "-b:a", "256k",
+        "-pix_fmt", "yuv420p",
+        "-colorspace", "bt709",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-t", f"{total_duration:.2f}",
+        "-movflags", "+faststart",
+        output_path
+    ]
+
+    tracker.log(f"⏳ FFmpeg đang render video Studio ({fps} FPS, CRF {video_crf}, BT.709, Slide-Up Animation)...")
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"FFmpeg composite lỗi:\n{res.stderr[-1000:]}")
+    tracker.log(f"✅ FFmpeg xuất video chất lượng cao thành công: {output_path}")
+
+
+def run_pipeline(post=None, bg_mode: str = None, card_theme: str = None,
+                 reset_tracker: bool = True, skip_cards_render: bool = False,
+                 skip_audio_generation: bool = False,
+                 layout_preset: str = None, enable_attached_image: bool = None,
+                 bgm_choice: str = None, bgm_volume: float = None,
+                 platform: str = None) -> str:
+    """
+    Quy trình tự động hoàn chỉnh từ dữ liệu -> video thành phẩm chuẩn đồ thị cảm xúc.
+    Đồng bộ và cập nhật liên tục sang tracker để giao diện Web UI hiển thị.
+    Hỗ trợ tùy biến bố cục video: split_screen, center, bottom_story.
+    Hỗ trợ đa nền tảng nội dung: Threads, Facebook, Instagram (kèm hình ảnh đính kèm).
+    Hỗ trợ bật/tắt ảnh đính kèm trong câu hỏi & ảnh minh họa pop-up nổi bên ngoài.
+    """
+    cfg = config_mod.load_config()
+    layout = cfg.get("visual_layout", {})
+
+    if post is None:
+        sample_path = os.path.join(OUT_DIR, "sample_post.json")
+        if os.path.exists(sample_path):
+            post = content_mod.load_from_json(sample_path)
+        else:
+            radar_spec = importlib.util.spec_from_file_location("radar", os.path.join(SRC_DIR, "threads_radar.py"))
+            radar_mod = importlib.util.module_from_spec(radar_spec)
+            radar_spec.loader.exec_module(radar_mod)
+            post = radar_mod.crawl_trending_threads_story()
+
+    if bg_mode is None or bg_mode == "auto":
+        post_text = (getattr(post, "content", "") + " " + getattr(post, "video_title", "")).lower()
+        if any(k in post_text for k in ["cafe", "tâm sự", "buồn", "chia tay", "chữa lành", "thất tình", "mẹ"]):
+            bg_mode = "gradient_lofi"
+        elif any(k in post_text for k in ["công nghệ", "it", "dev", "lương", "code", "hacker", "game"]):
+            bg_mode = "infinity_neon"
+        elif any(k in post_text for k in ["quốc tế", "lịch sử", "bí ẩn", "thế kỷ", "vụ án"]):
+            bg_mode = "infinity_dark"
+        elif any(k in post_text for k in ["thư giãn", "chill", "ngủ ngon"]):
+            bg_mode = "kinetic_sand"
+        else:
+            def_bg = layout.get("default_bg_mode", "infinity_neon")
+            bg_mode = "infinity_neon" if def_bg == "minecraft" else def_bg
+
+    if card_theme is None or card_theme == "auto":
+        card_theme = getattr(post, "recommended_theme", "") or layout.get("default_card_theme", "light")
+
+    if reset_tracker:
+        tracker.reset()
+    tracker.log(f"🎬 Bắt đầu quy trình sản xuất video (Chủ đề: {getattr(post, 'video_title', 'Threads Story')})")
+
+    try:
+        # BƯỚC 1: KỊCH BẢN & ĐỒ THỊ CẢM XÚC
+        if reset_tracker:
+            tracker.start_step("script", "Đang phân tích cấu trúc kịch bản và đồ thị cảm xúc...", 10)
+            time.sleep(0.3)
+            tracker.finish_step("script")
+
+        # BƯỚC 2: RENDER BỘ THẺ NỀN TẢNG (AVATAR NGƯỜI THẬT & HÌNH ẢNH MINH HỌA)
+        if not skip_cards_render:
+            plat = platform or getattr(post, "platform", "threads") or "threads"
+            if plat == "auto":
+                plat = getattr(post, "platform", "threads") or "threads"
+                if plat == "auto":
+                    plat = "threads"
+            tracker.start_step("cards", f"Đang render bộ thẻ {plat.upper()} chuẩn (Avatar người thật)...", 25)
+            os.makedirs(CARDS_DIR, exist_ok=True)
+            post_avatar = getattr(post, "avatar_url", "") or getattr(post, "avatar_path", "")
+            enable_illus = bool(getattr(post, "enable_illustration", True))
+            post_illus = getattr(post, "illustration_path", "")
+            placement = getattr(post, "visual_proof_placement", "attached_in_post")
+            if enable_illus and post_illus and os.path.exists(post_illus):
+                if not placement or placement == "none":
+                    placement = "attached_in_post"
+                has_proof = True
+            else:
+                post_illus = ""
+                enable_illus = False
+                has_proof = False
+            illus_cat = getattr(post, "illustration_category", "general_life")
+
+            # Quyết định ảnh gắn kèm bài đăng (Attached in Post):
+            illus_cfg = cfg.get("illustration_settings", {})
+            use_attached = (placement == "attached_in_post") or (plat in ["facebook", "instagram"] and enable_illus) or (enable_attached_image if enable_attached_image is not None else illus_cfg.get("enable_post_attached_image", False))
+            attached_img_arg = post_illus if (enable_illus and use_attached and post_illus and os.path.exists(post_illus)) else None
+
+            post_img = card_mod.render_post_card(
+                post.username, post.content, post.avatar_color, post.is_verified, post.likes,
+                theme=card_theme, avatar_source=post_avatar,
+                attached_image_path=attached_img_arg,
+                platform=plat
+            )
+            card_mod.save_card(post_img, os.path.join(CARDS_DIR, "post.png"))
+
+            # Render các thẻ bước trung gian nếu bật chế độ bung câu từng dòng (Sentence Reveal)
+            reveal_mode = getattr(post, "sentence_reveal_mode", "standard_full")
+            raw_sentences = re.split(r"(?<=[.!?\n])\s+", post.content.strip())
+            sentences = [s.strip() for s in raw_sentences if s.strip()]
+            if reveal_mode == "progressive_line_reveal" and len(sentences) >= 2:
+                for step_idx in range(1, len(sentences)):
+                    step_img = card_mod.render_post_card(
+                        post.username, post.content, post.avatar_color, post.is_verified, post.likes,
+                        theme=card_theme, avatar_source=post_avatar,
+                        attached_image_path=attached_img_arg,
+                        visible_sentence_count=step_idx,
+                        total_sentences_content=post.content,
+                        platform=plat
+                    )
+                    card_mod.save_card(step_img, os.path.join(CARDS_DIR, f"post_step_{step_idx}.png"))
+
+            # Tạo thẻ ảnh minh họa nổi bên ngoài: Kích hoạt khi có ảnh minh họa và bật tính năng popup
+            popup_path = os.path.join(CARDS_DIR, "popup_proof.png")
+            allow_popup = enable_illus and illus_cfg.get("enable_popup_illustration", True)
+            if allow_popup and post_illus and os.path.exists(post_illus):
+                badge_lbl = illus_cfg.get("badge_text", "") or "BẰNG CHỨNG CÓ THẬT"
+                caption_lbl = getattr(post, "illustration_caption", "") or "Hình ảnh áo phông mỏng dính"
+                card_mod.create_popup_illustration_card(post_illus, popup_path, badge_text=badge_lbl, caption_text=caption_lbl)
+                tracker.log(f"  📸 Đã tạo khung ảnh minh họa nổi (Popup Proof Card): {popup_path}")
+            else:
+                if os.path.exists(popup_path):
+                    try: os.remove(popup_path)
+                    except OSError: pass
+
+            # Tạo các thẻ ảnh minh họa tư liệu đa điểm rơi (True Story Cutaways)
+            for p_idx, p_item in enumerate(getattr(post, "popup_illustrations", []), 1):
+                p_src = p_item.get("src", "") or p_item.get("path", "")
+                p_out = os.path.join(CARDS_DIR, f"popup_proof_{p_idx}.png")
+                if p_src and os.path.exists(p_src) and not p_src.endswith(f"popup_proof_{p_idx}.png"):
+                    badge_lbl = p_item.get("badge", "TƯ LIỆU CÓ THẬT")
+                    caption_lbl = p_item.get("caption", "")
+                    card_mod.create_popup_illustration_card(p_src, p_out, badge_text=badge_lbl, caption_text=caption_lbl)
+                    p_item["path"] = p_out
+                    tracker.log(f"  📸 Đã tạo khung ảnh tư liệu [{p_idx}]: {p_out}")
+
+            for i, c in enumerate(post.comments, 1):
+                c_avatar = getattr(c, "avatar_url", "") or getattr(c, "avatar_path", "")
+                c_reply = getattr(c, "reply_to", "") or post.username
+                c_img = card_mod.render_comment_card(
+                    c.username, c.content, c.avatar_color, c.is_verified, c.likes,
+                    index=i, reply_to=c_reply, theme=card_theme, avatar_source=c_avatar,
+                    platform=plat
+                )
+                card_mod.save_card(c_img, os.path.join(CARDS_DIR, f"comment_{i}.png"))
+
+            # Tạo thẻ Outro Call-To-Action nếu được bật
+            if layout.get("enable_outro_cta", True):
+                outro_card_path = os.path.join(CARDS_DIR, "outro_cta.png")
+                cta_q = getattr(post, "cta_question", "") or "Còn bạn thì sao? Đã từng gặp tình huống éo le tương tự chưa?"
+                card_mod.render_outro_cta_card(question_text=cta_q, output_path=outro_card_path, platform=plat)
+                tracker.log(f"  📢 Đã tạo thẻ Outro Call-To-Action ({plat}): {outro_card_path}")
+
+            tracker.finish_step("cards")
+
+            tracker.finish_step("cards")
+
+        # BƯỚC 3: DIỄN XUẤT GIỌNG ĐỌC ĐA VAI (TTS + VOCAL MASTERING)
+        post_audio_file = os.path.join(AUDIO_DIR, "post.mp3")
+        if skip_audio_generation and os.path.exists(post_audio_file):
+            tracker.start_step("tts", "Sử dụng audio chất lượng cao đã tạo sẵn...", 45)
+            timing = {
+                "post": {
+                    "path": post_audio_file,
+                    "duration_ms": tts_mod.get_mp3_duration_ms(post_audio_file),
+                    "voice": getattr(post, "voice_id", "") or "nam_hai",
+                },
+                "comments": [],
+                "pauses": {}
+            }
+            for i, comment in enumerate(post.comments, 1):
+                cp = os.path.join(AUDIO_DIR, f"comment_{i}.mp3")
+                timing["comments"].append({
+                    "path": cp,
+                    "duration_ms": tts_mod.get_mp3_duration_ms(cp) if os.path.exists(cp) else 3000.0,
+                    "voice": getattr(comment, "voice_id", "") or "nu_cakhia",
+                    "emotion": getattr(comment, "emotion", "funny"),
+                    "sfx": getattr(comment, "sfx", "none")
+                })
+            outro_path = os.path.join(AUDIO_DIR, "outro_cta.mp3")
+            if os.path.exists(outro_path):
+                timing["outro"] = {
+                    "path": outro_path,
+                    "duration_ms": tts_mod.get_mp3_duration_ms(outro_path),
+                    "voice": getattr(post, "voice_id", "") or "nu_cakhia",
+                    "text": getattr(post, "cta_question", "")
+                }
+            tracker.finish_step("tts")
+        else:
+            tracker.start_step("tts", "Đang tạo giọng đọc đa vai (Nam/Nữ) và xử lý Vocal Mastering (LUFS -14)...", 45)
+            timing = tts_mod.generate_all_audio(
+                post, out_dir=AUDIO_DIR,
+                progress_cb=lambda msg, pct: tracker.update_progress(45 + int(pct * 0.2), msg)
+            )
+            outro_path = os.path.join(AUDIO_DIR, "outro_cta.mp3")
+            if os.path.exists(outro_path):
+                timing["outro"] = {
+                    "path": outro_path,
+                    "duration_ms": tts_mod.get_mp3_duration_ms(outro_path),
+                    "voice": getattr(post, "voice_id", "") or "nu_cakhia",
+                    "text": getattr(post, "cta_question", "")
+                }
+            tracker.finish_step("tts")
+
+        # BƯỚC 4: THIẾT KẾ ÂM THANH & NHỊP THỞ
+        tracker.start_step("audio", "Đang đồng bộ timeline, chèn khoảng lặng kịch tính & mix nhạc nền...", 70)
+        timeline, audio_sequence, overlay_sfx, total_duration, emotional_arc_data = build_timeline_with_emotional_pacing(post, timing, layout_preset=layout_preset, bg_mode=bg_mode)
+        tracker.set_emotional_arc(emotional_arc_data)
+
+        mixed_audio_out = os.path.join(AUDIO_DIR, "_audio_final.mp3")
+        # Tự động chọn nhạc nền theo cấu hình hoặc từ kho assets/bgm
+        cfg = config_mod.load_config()
+        pacing = cfg.get("emotional_pacing", {})
+        enable_bgm = pacing.get("enable_bgm", True)
+
+        if bgm_choice == "none":
+            enable_bgm = False
+
+        selected_bgm = None
+        if enable_bgm:
+            bgm_candidates = []
+            bgm_dir = os.path.join(ASSETS_DIR, "bgm")
+            if os.path.exists(bgm_dir):
+                bgm_candidates += [os.path.join(bgm_dir, f) for f in os.listdir(bgm_dir) if f.lower().endswith((".mp3", ".wav", ".m4a"))]
+
+            # Ưu tiên các bản nhạc nhẹ, êm dịu, không tiếng trống dồn dập
+            gentle_candidates = [
+                p for p in bgm_candidates
+                if any(k in os.path.basename(p).lower() for k in ["gentle", "satie", "clair", "nocturne", "lofi_chill"])
+            ]
+
+            pref = bgm_choice or pacing.get("selected_bgm_file", "gentle_piano_satie.mp3")
+            if pref and pref not in ["random", "auto", "none"]:
+                exact_path = os.path.join(bgm_dir, pref)
+                if os.path.exists(exact_path):
+                    selected_bgm = exact_path
+
+            if not selected_bgm:
+                if gentle_candidates:
+                    selected_bgm = random.choice(gentle_candidates)
+                elif bgm_candidates:
+                    selected_bgm = random.choice(bgm_candidates)
+
+        vol = bgm_volume if bgm_volume is not None else pacing.get("bgm_volume_normal", 0.25)
+        if selected_bgm and enable_bgm:
+            tracker.log(f"  🎵 Nhạc nền êm dịu: {os.path.basename(selected_bgm)} (Âm lượng: {int(vol * 100)}%)")
+        else:
+            tracker.log("  🔇 Nhạc nền: Tắt (Chỉ dùng giọng đọc & SFX)")
+
+        bg_mod.build_mixed_audio_with_sfx(
+            audio_sequence, mixed_audio_out,
+            bg_music_path=selected_bgm,
+            overlay_sfx=overlay_sfx,
+            bg_volume=vol
+        )
+
+        # KHÓA ĐỒNG BỘ 100% GIỮA HÌNH VÀ TIẾNG (ZERO-DRIFT AUDIO/VIDEO SYNC LOCK)
+        actual_audio_dur = bg_mod.get_media_duration(mixed_audio_out)
+        if actual_audio_dur > 1.0:
+            total_duration = round(actual_audio_dur, 2)
+            tracker.log(f"  🔒 [ĐỒNG BỘ TUYỆT ĐỐI]: Khóa thời lượng hình ảnh khớp 100% thời lượng âm thanh thực tế: {total_duration}s")
+            # Cập nhật mốc kết thúc cho các layer ghim tới hết video
+            for item in timeline:
+                if item.get("end", 0) > total_duration - 0.5:
+                    item["end"] = total_duration
+
+        bg_video_out = os.path.join(FINAL_DIR, "_bg_temp.mp4")
+        effective_bg_mode = bg_mode
+        has_center_video = any(item.get("type") == "center_satisfying_video" for item in timeline)
+        if has_center_video and (not bg_mode or bg_mode in ["split_gameplay", "split", "split_screen"]):
+            effective_bg_mode = "gameplay"
+        bg_mod.prepare_background(total_duration, bg_video_out, mode=effective_bg_mode)
+        tracker.finish_step("audio")
+
+        # BƯỚC 5: DỰNG PHIM ĐA LỚP & CAMERA MOTION (60 FPS + SLIDE-UP + LOSSLESS CRF 18)
+        tracker.start_step("composite", "FFmpeg dựng phim 60 FPS, hiệu ứng trượt thẻ Slide-Up & Camera Shake...", 85)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_video = os.path.join(FINAL_DIR, f"final_meme_pro_{timestamp}.mp4")
+
+        ass_sub_path = None
+        if layout.get("enable_kinetic_subtitles", False):
+            ass_sub_path = os.path.join(OUT_DIR, "subtitles.ass")
+            generate_kinetic_subtitles_ass(post, timing, timeline, ass_sub_path)
+            tracker.log(f"  ✨ Đã tạo phụ đề động Kinetic Subtitles: {ass_sub_path}")
+
+        compose_video(bg_video_out, mixed_audio_out, timeline, total_duration, final_video, ass_subtitle_path=ass_sub_path)
+        tracker.finish_step("composite")
+
+        # BƯỚC 6: ĐÓNG GÓI & TỐI ƯU VIRAL
+        tracker.start_step("export", "Đang đóng gói video, caption và thẻ hashtag viral...", 95)
+        caption_txt_path = final_video.replace(".mp4", "_caption.txt")
+        title_text = getattr(post, "video_title", "") or f"Chuyện Threads Hài Hước"
+        caption_text = getattr(post, "video_caption", "") or post.content[:120]
+        hashtag_text = getattr(post, "hashtags", "") or "#xuhuong #haihuoc #threads #fyp #minecraftparkour"
+
+        caption_full = (
+            f"🎬 TIÊU ĐỀ: {title_text}\n\n"
+            f"📝 CAPTION ĐĂNG TIKTOK / REELS:\n{caption_text}\n\n"
+            f"🏷️ HASHTAGS:\n{hashtag_text}\n"
+        )
+        with open(caption_txt_path, "w", encoding="utf-8") as f:
+            f.write(caption_full)
+
+        # Tự động render ảnh bìa Thumbnail tỉ lệ 9:16 chuẩn viral (Auto Clickbait Cover Maker)
+        if layout.get("enable_auto_thumbnail", True):
+            thumb_bg_path = os.path.join(FINAL_DIR, "_thumb_frame.jpg")
+            thumb_out_path = final_video.replace(".mp4", "_thumbnail.jpg")
+            exe = bg_mod.get_ffmpeg_exe()
+            subprocess.run([
+                exe, "-y", "-ss", "1.5", "-i", final_video,
+                "-vframes", "1", "-q:v", "2", thumb_bg_path
+            ], capture_output=True)
+            if os.path.exists(thumb_bg_path):
+                card_mod.render_video_thumbnail(post, thumb_bg_path, thumb_out_path)
+                tracker.log(f"  🖼️ Đã tạo ảnh bìa Thumbnail chuẩn tỉ lệ 9:16: {thumb_out_path}")
+                try:
+                    os.remove(thumb_bg_path)
+                except Exception:
+                    pass
+
+        # Tự động dọn dẹp video nền tạm thời để tránh tốn dung lượng đĩa
+        if 'bg_video_out' in locals() and os.path.exists(bg_video_out):
+            try:
+                os.remove(bg_video_out)
+            except Exception:
+                pass
+
+        tracker.finish_step("export")
+        tracker.finish_pipeline(os.path.basename(final_video), caption_full, total_duration)
+
+        return final_video
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        tracker.set_error(str(e))
+        raise e
+
+
+if __name__ == "__main__":
+    run_pipeline()
